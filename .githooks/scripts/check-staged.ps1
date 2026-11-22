@@ -1,433 +1,180 @@
 $ErrorActionPreference = 'Stop'
+$VerbosePreference = 'SilentlyContinue'
 Set-Location $PSScriptRoot
-
 function Write-Log($message)
 {
-    Write-Host $message
+    Write-Host "[$([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))] $message"
 }
 
 function Get-Configuration
 {
-    $scriptRoot = (Get-Item '.').FullName
+    
+    $configRoot = (Get-Item '..\config').FullName
     $repoRoot = (Get-Item '..\..').FullName
-    $configRoot = "$scriptRoot\..\config"
-    $configuration = [pscustomobject]@{}
-    $configuration | Add-Member -NotePropertyName 'ScriptRoot' -NotePropertyValue $scriptRoot -Force
-    $configuration | Add-Member -NotePropertyName 'RepoRoot' -NotePropertyValue $repoRoot -Force
-    $configuration | Add-Member -NotePropertyName 'PatternsPath' -NotePropertyValue "$configRoot\patterns.json" -Force
-    $configuration | Add-Member -NotePropertyName 'ChecksPath' -NotePropertyValue "$configRoot\checks.json" -Force
-    $configuration | Add-Member -NotePropertyName 'CodeRulesPath' -NotePropertyValue "$configRoot\code-rules.json" -Force
-    $configuration | Add-Member -NotePropertyName 'ExemptionsPath' -NotePropertyValue "$configRoot\exemptions.json" -Force
+    $configuration = Get-Content "$configRoot\configuration.json" | ConvertFrom-Json
+    $configuration | Add-Member -MemberType NoteProperty -Name "ConfigRoot" -Value $configRoot
+    $configuration | Add-Member -MemberType NoteProperty -Name "RepoRoot" -Value $repoRoot
     return $configuration
 }
 
-function Get-FileName($path)
+function Get-RulesFromFile($file)
 {
-    switch -Regex ($path)
-    {
-        '([^\\/]+)$' { return $Matches[1] }
-        default      { return $path }
+    return Get-Content $file.FullName | ConvertFrom-Json
+}
+function Add-RulesForLanguage($configuration, $languageName)
+{
+    $rules = @()
+    $rulesFiles = Get-ChildItem "$($configuration.ConfigRoot)\rules\enabled" -File -Recurse
+    $rulesFiles |%{
+        $rulesFromFile = Get-RulesFromFile $_
+        $rules += $rulesFromFile.rules |? { $_.appliesTo -eq $languageName }
     }
+    return $rules
 }
-
-function Get-Language($fileNameCheck)
+function Get-FilesInScopeForChange($configuration, $files)
 {
-    $fileName = $fileNameCheck.FileName
-    $languages = $fileNameCheck.Languages
-    $language = $null
-    $languages.PSObject.Properties |% {
-        $languageEntry = $_
-        $globs = @($languageEntry.Value)
-        $matched = @($globs |? { $fileName -like $_ })
-        if ([string]::IsNullOrEmpty($language) -and $matched.Count -gt 0)
-        {
-            $language = $languageEntry.Name
-        }
+    $included = $configuration.Include
+    $includedFiles = $files |? {
+        $fileName = $_.Name
+        $matchingGlob = $included |? { $fileName -like $_ } | Select-Object -First 1
+        $null -ne $matchingGlob
     }
-    return $language
-}
-
-function Get-PatternAllowCount($pattern, $text)
-{
-    $allowList = @($pattern.allow |? { ![string]::IsNullOrEmpty($_) })
-    $allowedCount = @($allowList |? { $text -match $_ }).Count
-    return $allowedCount
-}
-
-function Get-EnclosingFunctionName($lines)
-{
-    $names = @()
-    $pendingName = $null
-    $depth = 0
-    $openFunctions = @()
-
-    $lines |% {
-        $text = $_
-
-        if ($text -match '^\s*function\s+([A-Za-z0-9_-]+)')
-        {
-            $pendingName = $Matches[1]
-        }
-
-        $opened = ([regex]::Matches($text, '\{')).Count
-        $closed = ([regex]::Matches($text, '\}')).Count
-
-        if ($null -ne $pendingName -and $opened -gt 0)
-        {
-            $openFunctions += [pscustomobject]@{ Name = $pendingName; Depth = $depth }
-            $pendingName = $null
-        }
-
-        $current = $null
-        if ($openFunctions.Count -gt 0)
-        {
-            $current = $openFunctions[-1].Name
-        }
-        $names += $current
-
-        $depth = $depth + $opened - $closed
-        while ($openFunctions.Count -gt 0 -and $depth -le $openFunctions[-1].Depth)
-        {
-            $openFunctions = @($openFunctions | Select-Object -SkipLast 1)
-        }
+    $excluded = $configuration.Exclude
+    $files = $includedFiles |? {
+        $fileName = $_.Name
+        $matchingGlob = $excluded |? { $fileName -like $_ } | Select-Object -First 1
+        $null -eq $matchingGlob
     }
-
-    return $names
+    return $files
 }
-
-function Get-CodeViolation($fileCheck)
+function Get-FilesInScope($configuration)
 {
-    $path = $fileCheck.Path
-    $lines = $fileCheck.Lines
-    $rules = $fileCheck.Rules
-    $findings = @()
-    $lineNo = 0
-    $enclosingFunctions = Get-EnclosingFunctionName $lines
-
-    $lines |% {
-        $text = $_
-        $enclosingFunction = $null
-        if ($lineNo -lt $enclosingFunctions.Count)
-        {
-            $enclosingFunction = $enclosingFunctions[$lineNo]
-        }
-        $lineNo = $lineNo + 1
-
-        $rules |% {
-            $rule = $_
-            $scoped = !([string]::IsNullOrEmpty($rule.scopeName))
-            $insideScope = $scoped -and $enclosingFunction -eq $rule.scopeName
-            if (!$insideScope -and ($text -match $rule.regex))
-            {
-                $matchedText = [regex]::Match($text, $rule.regex, 'IgnoreCase').Value
-                $finding = [pscustomobject]@{
-                    File = $path
-                    Line = $lineNo
-                    Pattern = $rule.name
-                    Match = $matchedText
-                }
-                $findings += $finding
-            }
-        }
-    }
-
-    return $findings
+    $repoRoot = $configuration.RepoRoot
+    $filesChangedInCommit = git -C $repoRoot diff --cached --name-only --diff-filter=ACMR |% { Get-Item "$repoRoot\$_" }
+    $fileInScope = Get-FilesInScopeForChange $configuration $filesChangedInCommit
+    return $fileInScope
 }
-
 function Add-RuntimeConfiguration($configuration)
 {
-    $patterns = @((Get-Content -Path $configuration.PatternsPath -Raw | ConvertFrom-Json).patterns)
-    $checks = Get-Content -Path $configuration.ChecksPath -Raw | ConvertFrom-Json
-    $codeRules = Get-Content -Path $configuration.CodeRulesPath -Raw | ConvertFrom-Json
-    $exemptionFile = Get-Content -Path $configuration.ExemptionsPath -Raw | ConvertFrom-Json
-    $exemptions = @($exemptionFile.exemptions)
-    $include = @($checks.include)
-    $exclude = @($checks.exclude)
-
-    $gitDir = git -C $configuration.RepoRoot rev-parse --absolute-git-dir
-    if ($LASTEXITCODE -ne 0)
-    {
-        throw "git rev-parse --absolute-git-dir failed (exit $LASTEXITCODE)"
-    }
-    $messagePath = "$gitDir\COMMIT_EDITMSG"
-
-    $stagedFiles = @(git -C $configuration.RepoRoot diff --cached --name-only --diff-filter=ACM)
-    if ($LASTEXITCODE -ne 0)
-    {
-        throw "git diff --cached failed (exit $LASTEXITCODE)"
-    }
-
-    $targets = @($stagedFiles |? {
-        $stagedFile = $_
-        $fileName = Get-FileName $stagedFile
-        $includedCount = @($include |? { $fileName -like $_ }).Count
-        $excludedCount = @($exclude |? { $fileName -like $_ }).Count
-        $includedCount -gt 0 -and $excludedCount -eq 0
-    })
-
-    $configuration | Add-Member -NotePropertyName 'Patterns' -NotePropertyValue $patterns -Force
-    $configuration | Add-Member -NotePropertyName 'Languages' -NotePropertyValue $codeRules.languages -Force
-    $configuration | Add-Member -NotePropertyName 'CodeRules' -NotePropertyValue $codeRules.rules -Force
-    $configuration | Add-Member -NotePropertyName 'Targets' -NotePropertyValue $targets -Force
-    $configuration | Add-Member -NotePropertyName 'Exemptions' -NotePropertyValue $exemptions -Force
-    $configuration | Add-Member -NotePropertyName 'MessagePath' -NotePropertyValue $messagePath -Force
-    $exemptionTags = Get-ExemptionTag $configuration
-    $configuration | Add-Member -NotePropertyName 'ExemptionTags' -NotePropertyValue $exemptionTags -Force
+    $filesInScope = @(Get-FilesInScope $configuration)
+    $configuration | Add-Member -MemberType NoteProperty -Name "FilesInScope" -Value $filesInScope -Force
     return $configuration
 }
 
-function Invoke-PreflightCheck($configuration)
+function Invoke-CheckFile($file, $rules)
 {
-    $ruleFiles = @($configuration.PatternsPath, $configuration.ChecksPath, $configuration.CodeRulesPath, $configuration.ExemptionsPath)
-    $ruleFiles |% {
-        $ruleFile = $_
-        if (!(Test-Path $ruleFile))
-        {
-            throw "Rule file not found: $ruleFile"
-        }
+    Write-Log "Checking $file"
+    $violations = Get-Violations $file
+    return $violations
+}
+function Get-LanguageNameFromFileName($configuration, $file)
+{
+    
+    $fileName = $file.Name
+    $language = $configuration.languages |? {
+        $languageGlobs = $_.globs
+        $matchingGlob = $languageGlobs |? { $fileName -like $_ } | Select-Object -First 1
+        $null -ne $matchingGlob
     }
+    $languageName = $language.name
+    return $languageName
+}
+function Get-LanguageName($configuration, $file)
+{
+    $languageName = Get-LanguageNameFromFileName $configuration $file
+    return $languageName
 }
 
-function Get-StagedLine($stagedFileCheck)
+function Test-FileIsExcluded($configuration, $file) 
 {
-    $repoRoot = $stagedFileCheck.RepoRoot
-    $path = $stagedFileCheck.Path
-    $lines = @(git -C $repoRoot show ":$path")
-    if ($LASTEXITCODE -ne 0)
+    #test if file is excluded in the configuration.
+}
+function Get-LineNumbers($content, $regex)
+{
+    $match = [regex]::Match($content, $regex)
+    $linesBefore = $content.Substring(0, $match.Index) -split "`n"
+    $matchedLines = $match.Value -split "`n"
+    $firstLine = $linesBefore.Count
+    $lastLine = $firstLine + $matchedLines.Count - 1
+    $lineNumbers = "($firstLine-$lastLine)"
+    if ($firstLine -eq $lastLine)
     {
-        throw "git show :$path failed (exit $LASTEXITCODE)"
+        $lineNumbers = $firstLine
     }
-    return $lines
-}
-
-function Get-ContentFinding($configuration)
-{
-    $patterns = $configuration.Patterns
-    $findings = @()
-
-    $configuration.Targets |% {
-        $path = $_
-        $stagedFileCheck = [pscustomobject]@{
-            RepoRoot = $configuration.RepoRoot
-            Path = $path
-        }
-        $lines = Get-StagedLine $stagedFileCheck
-        $lineNo = 0
-
-        $lines |% {
-            $lineNo = $lineNo + 1
-            $text = $_
-            $patterns |% {
-                $pattern = $_
-                if ($text -match $pattern.regex)
-                {
-                    $allowedCount = Get-PatternAllowCount $pattern $text
-                    if ($allowedCount -eq 0)
-                    {
-                        $matchedText = [regex]::Match($text, $pattern.regex, 'IgnoreCase').Value
-                        $finding = [pscustomobject]@{
-                            File = $path
-                            Line = $lineNo
-                            Pattern = $pattern.name
-                            Match = $matchedText
-                        }
-                        $findings += $finding
-                    }
-                }
-            }
-        }
-    }
-
-    return $findings
-}
-
-function Get-CodeFinding($configuration)
-{
-    $findings = @()
-
-    $configuration.Targets |% {
-        $path = $_
-        $fileName = Get-FileName $path
-        $fileNameCheck = [pscustomobject]@{
-            FileName = $fileName
-            Languages = $configuration.Languages
-        }
-        $language = Get-Language $fileNameCheck
-
-        if ($language)
-        {
-            $stagedFileCheck = [pscustomobject]@{
-                RepoRoot = $configuration.RepoRoot
-                Path = $path
-            }
-            $lines = Get-StagedLine $stagedFileCheck
-            $rules = @($configuration.CodeRules |? { $_.appliesTo -contains $language })
-            $fileCheck = [pscustomobject]@{
-                Path = $path
-                Lines = $lines
-                Rules = $rules
-            }
-            $findings += Get-CodeViolation $fileCheck
-        }
-    }
-
-    return $findings
-}
-
-function Get-ExemptionTag($configuration)
-{
-    $messagePath = $configuration.MessagePath
-    $tags = @()
-    if (Test-Path $messagePath)
-    {
-        $message = Get-Content -Path $messagePath -Raw
-        $tags = @([regex]::Matches($message, '\[exemptions\|[^\]]+\]') |% {
-            $tagText = $_.Value
-            Get-ExemptionTagDetail $tagText
-        })
-    }
-    return $tags
-}
-
-function Get-ExemptionTagDetail($tagText)
-{
-    $body = $tagText.Trim('[', ']')
-    $fields = @($body -split '\|')
-    $fileSpec = $fields | Select-Object -Skip 1 -First 1
-    $lineSpec = $fields | Select-Object -Last 1
-    $pattern = $null
-    if ($fields.Count -eq 4)
-    {
-        $pattern = $fields | Select-Object -Skip 2 -First 1
-    }
-    $lineNumbers = Get-LineNumber $lineSpec
-    $detail = [pscustomobject]@{
-        FileSpec = $fileSpec
-        Pattern = $pattern
-        LineNumbers = $lineNumbers
-    }
-    return $detail
-}
-
-function Get-LineNumber($lineSpec)
-{
-    $lineNumbers = @($lineSpec -split ',' |% {
-        $token = $_
-        $bounds = @($token -split '-')
-        if ($bounds.Count -eq 2)
-        {
-            $from = [int]($bounds | Select-Object -First 1)
-            $to = [int]($bounds | Select-Object -Last 1)
-            $from..$to
-        }
-        else
-        {
-            [int]$token
-        }
-    })
     return $lineNumbers
 }
-
-function Invoke-CollectFindings($configuration)
+function Get-ViolationsForContent($file, $lineNumber, $content, $rules)
 {
-    $findings = @()
-    $findings += Get-ContentFinding $configuration
-    $findings += Get-CodeFinding $configuration
-    $configuration | Add-Member -NotePropertyName 'Findings' -NotePropertyValue $findings -Force
-    return $configuration
-}
-
-function Invoke-UpdateExemptions($configuration)
-{
-    $tags = $configuration.ExemptionTags
-    if ($tags.Count -eq 0)
-    {
-        return $configuration
+    $contentViolations = [psCustomobject]@{ 
+        HasViolations = $false
+        Violations = @()
     }
-
-    $findings = $configuration.Findings
-    $exemptions = $configuration.Exemptions
-    $candidates = @($tags |% {
-        $tag = $_
-        $findings |% {
-            $finding = $_
-            $isFile = $finding.File -like $tag.FileSpec
-            $isLine = $tag.LineNumbers -contains $finding.Line
-            $isPattern = [string]::IsNullOrEmpty($tag.Pattern) -or $tag.Pattern -eq $finding.Pattern
-            if ($isFile -and $isLine -and $isPattern)
+    $rules |%{
+        $rule = $_
+        Write-Verbose "Checking rule $($rule.name)"
+        $matchedAllowed = ($rule.allowedRegex) -and ($content -match $rule.allowedRegex)
+        $matchedBanned =  $content -match $rule.regex 
+        $contentHasViolations = $matchedBanned -and !$matchedAllowed
+        if ($contentHasViolations)
+        { 
+            $contentViolations.HasViolations = $true
+            $lineNumbers = $lineNumber
+            if ($rule.multiline)
             {
-                [pscustomobject]@{
-                    file = $finding.File
-                    line = $finding.Line
-                    pattern = $finding.Pattern
-                }
+                $lineNumbers = Get-LineNumbers $content $rule.regex
             }
+            $contentViolation = [pscustomobject]@{
+                RuleName = $rule.name
+                FileName = $file.Name
+                LineNumbers = $lineNumbers
+            }
+            $contentViolations.Violations += $contentViolation
         }
-    })
-
-    $newExemptions = @($candidates |? {
-        $candidate = $_
-        $existing = @($exemptions |? {
-            $exemption = $_
-            $exemption.file -eq $candidate.file -and $exemption.line -eq $candidate.line -and $exemption.pattern -eq $candidate.pattern
-        })
-        $existing.Count -eq 0
-    })
-    if ($newExemptions.Count -eq 0)
-    {
-        return $configuration
     }
-
-    $exemptionFile = [pscustomobject]@{
-        exemptions = @($exemptions + $newExemptions)
-    }
-    $exemptionFile | ConvertTo-Json -Depth 3 | Set-Content -Path $configuration.ExemptionsPath
-    $updated = $exemptionFile.exemptions
-    $configuration | Add-Member -NotePropertyName 'Exemptions' -NotePropertyValue $updated -Force
-    return $configuration
+    return $contentViolations
 }
-
-function Remove-ExemptedFinding($configuration)
+function Invoke-CheckFile($file, $rules)
 {
-    $exemptions = $configuration.Exemptions
-    $findings = @($configuration.Findings |? {
-        $finding = $_
-        $exempted = @($exemptions |? {
-            $exemption = $_
-            $isFile = $exemption.file -eq $finding.File
-            $isLine = $exemption.line -eq $finding.Line
-            $isPattern = [string]::IsNullOrEmpty($exemption.pattern) -or $exemption.pattern -eq $finding.Pattern
-            $isFile -and $isLine -and $isPattern
-        })
-        $exempted.Count -eq 0
-    })
-    $configuration | Add-Member -NotePropertyName 'Findings' -NotePropertyValue $findings -Force
-    return $configuration
+    $violations = @()
+    $lineNumber = 0
+    Get-Content $file.FullName |% {
+        $content = $_
+        $lineNumber++
+        $singleLineRules = $rules |? { !$_.multiline }
+        $contentViolations = Get-ViolationsForContent $file $lineNumber $content $singleLineRules
+        if ($contentViolations.HasViolations)
+        { 
+            $violations += $contentViolations.Violations 
+        }
+    }
+    $content = Get-Content -Raw $file.FullName
+    $multiLineRules = $rules |? { $_.multiline }
+    $contentViolations = Get-ViolationsForContent $file $null $content $multiLineRules
+    if ($contentViolations.HasViolations) { 
+        $violations += $contentViolations.Violations 
+    }
+    return $violations
 }
 
-function Invoke-CheckEnabled($configuration)
+function Invoke-CommitGate($configuration)
 {
-    $findings = $configuration.Findings
-    if ($findings.Count -eq 0)
+    $filesInScope = $configuration.FilesInScope #we have already filtered in Add-RuntimeConfiguration.
+    $violations = @()
+    $filesInScope |%{
+        $file = $_
+        $languageName = Get-LanguageNameFromFileName $configuration $file
+        $rules = Add-RulesForLanguage $configuration $languageName
+        $violations += Invoke-CheckFile $file $rules
+    }
+    $violations |%{
+        $violation = $_
+        Write-Log "Violation in $($violation.FileName). Line number(s) $($violation.LineNumbers). Rule Name: $($violation.RuleName)"
+    }
+    if ($violations.Count -gt 0)
     {
-        exit 0
+        exit 1
     }
-
-    Write-Log "Commit blocked: $($findings.Count) violation(s) in staged changes."
-    $findings |% {
-        $finding = $_
-        Write-Log "  $($finding.File):$($finding.Line)  $($finding.Pattern)  $($finding.Match)"
-    }
-    Write-Log "Credential and PII patterns: $($configuration.PatternsPath)"
-    Write-Log "Code rules: $($configuration.CodeRulesPath)"
-    Write-Log "Exemptions: $($configuration.ExemptionsPath)"
-    exit 1
 }
-
 $configuration = Get-Configuration
 $configuration = Add-RuntimeConfiguration $configuration
-Invoke-PreflightCheck $configuration
-$configuration = Invoke-CollectFindings $configuration
-$configuration = Invoke-UpdateExemptions $configuration
-$configuration = Remove-ExemptedFinding $configuration
-Invoke-CheckEnabled $configuration
+Invoke-CommitGate $configuration
